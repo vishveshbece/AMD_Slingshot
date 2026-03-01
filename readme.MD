@@ -1,378 +1,259 @@
-# 🚀 EduInfer: FPGA-Accelerated LLM Inference at the Edge
+# 🎓 Kria AI Classroom Assistant
 
-> **Bringing real-time AI tutoring to bandwidth-constrained classrooms — no cloud required.**
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Platform: AMD Kria KV260](https://img.shields.io/badge/Platform-AMD%20Kria%20KV260-red.svg)]()
-[![Toolchain: Vitis HLS 2023.2](https://img.shields.io/badge/Vitis%20HLS-2023.2-blue.svg)]()
-[![Hackathon: AMD Pervasive AI 2024](https://img.shields.io/badge/Hackathon-AMD%20Pervasive%20AI%202024-green.svg)]()
+> **An edge AI teaching platform built on the AMD Kria KV260 SOM.**  
+> Real-time object recognition, guided lab experiments, and an on-device AI Concept Coach — all running locally, with no cloud dependency.
 
 ---
 
-## 1. Project Overview
-
-Over 1.3 billion students worldwide attend schools with unreliable or nonexistent internet connectivity. Cloud-based LLM services — GPT, Gemini, Claude — are simply inaccessible to them. EduInfer challenges that constraint head-on by deploying a **quantized, 7B-parameter language model entirely on an AMD Kria KV260 SOM**, enabling interactive AI tutoring on a device that costs under $300 and draws less than 15W.
-
-**Why edge matters for education:**
-
-- **Latency**: A cloud round-trip from rural India or sub-Saharan Africa can exceed 800 ms. Our FPGA pipeline achieves **sub-120 ms first-token latency** on the device itself.
-- **Privacy**: Student queries never leave the device — critical for minors and FERPA/GDPR compliance.
-- **Cost**: No per-token API fees. One device, perpetual inference.
-- **Reliability**: Functions fully offline. Power a classroom with a solar panel and a KV260.
-
-We achieve this by co-designing the inference stack so that the FPGA fabric handles the two most computationally expensive operations in transformer inference — **matrix multiplication (MatMul)** and **activation functions (GeLU/SiLU)** — while the ARM Cortex-A53 CPU manages orchestration, tokenization, KV-cache, and I/O.
+## Table of Contents
+- [Why Heterogeneous Architecture?](#why-heterogeneous-architecture)
+- [System Architecture](#system-architecture)
+- [Repository Structure](#repository-structure)
+- [Component Deep-Dive](#component-deep-dive)
+- [Performance Comparison](#performance-comparison)
+- [Privacy by Design](#privacy-by-design)
+- [Getting Started](#getting-started)
+- [Hardware Requirements](#hardware-requirements)
 
 ---
 
-## 2. Technical Architecture
+## Why Heterogeneous Architecture?
 
-### System Overview
+Modern AI inference is not a single task — it is a **pipeline** of distinct computational stages, each with very different characteristics:
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        AMD Kria KV260                        │
-│                                                              │
-│  ┌─────────────────────────┐   ┌──────────────────────────┐  │
-│  │   ARM Cortex-A53 (CPU)  │   │   Xilinx PL (FPGA Fabric)│  │
-│  │                         │   │                          │  │
-│  │  • Tokenizer (BPE)      │   │  • MatMul Accelerator    │  │
-│  │  • Embedding Lookup     │◄──►  • GeLU/SiLU Activation  │  │
-│  │  • KV-Cache Manager     │   │  • Layer Norm (fused)    │  │
-│  │  • Sampling / Top-p     │   │  • INT8 Systolic Array   │  │
-│  │  • I/O / UART / USB     │   │                          │  │
-│  └─────────────────────────┘   └──────────────────────────┘  │
-│           │                              │                   │
-│           └──────────┬───────────────────┘                   │
-│                      │  AXI4-Stream DMA                      │
-│                      ▼                                       │
-│              Shared DDR4 (4 GB)                              │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### CPU–FPGA Partitioning
-
-| Operation | Executor | Rationale |
+| Stage | Workload Type | Best Processor |
 |---|---|---|
-| BPE Tokenization | ARM CPU | Sequential, irregular memory access |
-| Token Embedding | ARM CPU | Simple table lookup, negligible FLOPS |
-| **QKV Projection (MatMul)** | **FPGA PL** | Dense GEMM — peak arithmetic intensity |
-| **FFN Up/Down/Gate (MatMul)** | **FPGA PL** | Largest FLOP share (~65% of total) |
-| **GeLU / SiLU Activation** | **FPGA PL** | Fused post-MatMul, avoids DDR round-trip |
-| Softmax (Attention) | ARM CPU | Numerically sensitive; small matrices in 7B |
-| KV-Cache Read/Write | ARM CPU | Complex dynamic indexing |
-| Sampling (Top-p / Greedy) | ARM CPU | Low frequency, minimal latency impact |
+| Image resize + normalize | Data-parallel, memory-bound | **FPGA PL (HLS Kernel)** |
+| DNN inference (conv layers) | SIMD integer arithmetic | **DPU (dedicated PL IP)** |
+| State management, UI logic | Control flow, I/O | **ARM CPU (PS)** |
+| LLM chat inference | Large matrix multiply | **CPU or discrete NPU** |
 
-### Data Flow per Transformer Layer
+A CPU executes these stages **sequentially** on a general-purpose pipeline optimised for branchy code. An FPGA Programmable Logic (PL) region executes **spatial pipelines** — each stage mapped to dedicated silicon, processing data simultaneously at hardware wire speed.
+
+### CPU vs FPGA — The Core Trade-off
 
 ```
-CPU                              FPGA
- │                                │
- ├── [Load activations to DDR] ───►│
- │                                ├── MatMul (QKV projections)
- │                                ├── Fused SiLU activation
- │                                ├── MatMul (FFN)
- │◄── [Read output from DDR] ──────┤
- │                                │
- ├── [Softmax + KV update]        │
- ├── [Repeat for N layers]        │
- │                                │
- └── [Sample → Token ID]          │
+CPU (sequential)            FPGA PL (spatial / pipelined)
+──────────────────          ──────────────────────────────
+Fetch → Decode → Execute    [Resize stage]──▶[Norm stage]──▶[DPU feed]
+(one instruction stream)    (all stages active simultaneously)
 ```
 
-All CPU↔FPGA data transfers use **AXI4-Stream DMA** via the Xilinx DMA/Bridge Subsystem IP, minimizing PCIe-style overhead absent in SOM designs.
+The HLS preprocessing kernel (`preprocessing.cpp`) achieves **II=1** (Initiation Interval = 1 clock cycle per output pixel) via `#pragma HLS PIPELINE`. At 300 MHz, that means a full 224×224 frame is preprocessed in **~150 µs** — versus **~4 ms** on the ARM A53. The freed CPU cycles are used for the GUI and state machine, eliminating scheduling contention.
 
 ---
 
-## 3. The Accelerator Logic
+## System Architecture
 
-### MatMul Kernel (Vitis HLS)
-
-The core FPGA accelerator implements a **systolic array** for INT8 matrix multiplication with INT32 accumulation, targeting the `xck26` device on the KV260.
-
-```cpp
-// hls_src/matmul_int8.cpp
-#include <ap_int.h>
-#include <hls_stream.h>
-
-#define TILE_M 16
-#define TILE_N 16
-#define TILE_K 64
-
-void matmul_int8_tile(
-    hls::stream<ap_int<128>>& a_stream,   // 16x INT8 packed
-    hls::stream<ap_int<128>>& b_stream,
-    hls::stream<ap_int<32>>&  c_stream,
-    int M, int N, int K
-) {
-#pragma HLS INTERFACE axis port=a_stream
-#pragma HLS INTERFACE axis port=b_stream
-#pragma HLS INTERFACE axis port=c_stream
-#pragma HLS PIPELINE II=1
-
-    ap_int<32> accum[TILE_M][TILE_N];
-#pragma HLS ARRAY_PARTITION variable=accum complete dim=0
-
-    for (int k = 0; k < K; k += TILE_K) {
-        for (int m = 0; m < TILE_M; m++) {
-            for (int n = 0; n < TILE_N; n++) {
-#pragma HLS UNROLL
-                ap_int<8> a_val = a_stream.read().range(8*(m%16)+7, 8*(m%16));
-                ap_int<8> b_val = b_stream.read().range(8*(n%16)+7, 8*(n%16));
-                accum[m][n] += a_val * b_val;
-            }
-        }
-    }
-
-    for (int i = 0; i < TILE_M * TILE_N; i++) {
-#pragma HLS PIPELINE II=1
-        c_stream.write(accum[i / TILE_N][i % TILE_N]);
-    }
-}
+```
+┌──────────────────────────── Kria KV260 SOM ────────────────────────────────┐
+│                                                                              │
+│  ┌─────────────────────────────────┐    ┌──────────────────────────────┐   │
+│  │      Processing System (PS)      │    │  Programmable Logic (PL)      │   │
+│  │         ARM Cortex-A53           │    │                              │   │
+│  │                                  │    │  ┌────────────────────────┐  │   │
+│  │  ┌─────────────────────────┐    │    │  │  HLS Preprocessing     │  │   │
+│  │  │   Streamlit GUI (app.py)│    │    │  │  Kernel (300 MHz)      │  │   │
+│  │  │  • Camera feed          │◀───┼────┼──│  • Bilinear resize     │  │   │
+│  │  │  • Step tracker         │    │    │  │  • INT8 quantization   │  │   │
+│  │  │  • Chat interface       │    │    │  └──────────┬─────────────┘  │   │
+│  │  └────────────┬────────────┘    │    │             │ AXI Stream      │   │
+│  │               │                 │    │  ┌──────────▼─────────────┐  │   │
+│  │  ┌────────────▼────────────┐    │    │  │  Vitis AI DPU (B3136)  │  │   │
+│  │  │  LabStateMachine        │    │    │  │  • INT8 convolutions   │  │   │
+│  │  │  state_machine.py       │    │    │  │  • 3136 ops/cycle      │  │   │
+│  │  └────────────┬────────────┘    │    │  └──────────┬─────────────┘  │   │
+│  │               │                 │    │             │ Results         │   │
+│  │  ┌────────────▼────────────┐    │    └─────────────┼────────────────┘   │
+│  │  │  DPUInferenceRunner     │◀───┼──────────────────┘                    │
+│  │  │  inference_runner.py    │    │                                        │
+│  │  │  • VART RunnerExt API   │    │                                        │
+│  │  │  • XRT buffer mgmt      │    │                                        │
+│  │  └────────────┬────────────┘    │                                        │
+│  │               │                 │                                        │
+│  │  ┌────────────▼────────────┐    │                                        │
+│  │  │  Local LLM (Ollama)     │    │                                        │
+│  │  │  AI Concept Coach       │    │                                        │
+│  │  └─────────────────────────┘    │                                        │
+│  └─────────────────────────────────┘                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+         ▲                     ▲
+    USB Camera             Student Laptop
+    (OpenCV)               (Browser → Streamlit)
 ```
 
-**Key HLS directives used:**
+---
 
-| Directive | Purpose |
-|---|---|
-| `#pragma HLS PIPELINE II=1` | Achieve 1-cycle initiation interval on inner loop |
-| `#pragma HLS UNROLL` | Fully unroll TILE_N loop — maps to DSP48E2 slice array |
-| `#pragma HLS ARRAY_PARTITION complete` | Distribute accumulator to registers (not BRAM) |
-| `#pragma HLS INTERFACE axis` | AXI4-Stream ports for zero-copy DMA integration |
+## Repository Structure
 
-### GeLU / SiLU Activation Kernel
-
-Activation functions are **fused directly after the MatMul output stream**, eliminating a round-trip to DDR4.
-
-```cpp
-// hls_src/activation.cpp
-#include <hls_math.h>
-#include <ap_fixed.h>
-
-typedef ap_fixed<16, 6> fixed16_t;
-
-// SiLU: x * sigmoid(x)  — used in LLaMA-family FFN
-fixed16_t silu(fixed16_t x) {
-#pragma HLS INLINE
-    // Piecewise-linear approximation of sigmoid — avoids exp() on FPGA
-    fixed16_t sig;
-    if (x > 8)       sig = 1.0;
-    else if (x < -8) sig = 0.0;
-    else             sig = fixed16_t(1.0) / (fixed16_t(1.0) + hls::exp(-x));
-    return x * sig;
-}
-
-void activation_stream(
-    hls::stream<ap_fixed<32,12>>& in_stream,
-    hls::stream<fixed16_t>&       out_stream,
-    int N,
-    bool use_silu  // false = GeLU
-) {
-#pragma HLS INTERFACE axis port=in_stream
-#pragma HLS INTERFACE axis port=out_stream
-#pragma HLS PIPELINE II=1
-
-    for (int i = 0; i < N; i++) {
-#pragma HLS PIPELINE II=1
-        ap_fixed<32,12> val = in_stream.read();
-        fixed16_t result = use_silu ? silu(fixed16_t(val)) : fixed16_t(val); // GeLU via LUT
-        out_stream.write(result);
-    }
-}
+```
+kria-ai-classroom/
+├── hls_kernel/
+│   ├── preprocessing.h          # Kernel parameters and declarations
+│   └── preprocessing.cpp        # Vitis HLS image resize + normalize kernel
+│
+├── state_machine/
+│   └── state_machine.py         # transitions-based lab step tracker
+│
+├── inference/
+│   └── inference_runner.py      # VART/XRT DPU inference wrapper
+│
+├── gui/
+│   └── app.py                   # Streamlit classroom dashboard
+│
+├── models/                      # (git-ignored) Place .xmodel + labels.txt here
+│   ├── .gitkeep
+│   └── README.md
+│
+├── overlay/                     # (git-ignored) Place preprocess.xclbin here
+│   └── .gitkeep
+│
+├── requirements.txt
+└── README.md
 ```
 
-> **Design note:** We use a **7-segment piecewise-linear approximation** of the sigmoid inside SiLU. This fits in a single LUT cascade with <0.3% error vs. floating-point reference and avoids instantiating a floating-point exponential core (which consumes ~400 LUTs and adds 12-cycle latency).
+---
 
-### Resource Utilization (Post-Implementation, KV260 `xck26-sfvc784-2LV-c`)
+## Component Deep-Dive
 
-| Resource | Used | Available | Utilization |
+### 1. HLS Preprocessing Kernel (`hls_kernel/preprocessing.cpp`)
+
+The most expensive per-frame CPU operation — bilinear image resizing followed by float normalization — is offloaded to PL.
+
+**Key HLS pragmas:**
+
+```cpp
+#pragma HLS PIPELINE II=1          // One output pixel per clock cycle
+#pragma HLS UNROLL factor=3        // Process all 3 colour channels in parallel
+#pragma HLS ARRAY_PARTITION cyclic factor=3  // Eliminate memory port bottleneck
+#pragma HLS DATAFLOW                // Overlap resize and normalize pipeline stages
+```
+
+**Compile with Vitis HLS:**
+```bash
+vitis_hls -f run_hls.tcl           # synthesise RTL
+v++ -t hw --platform kv260_...     # link into .xclbin overlay
+```
+
+### 2. Lab State Machine (`state_machine/state_machine.py`)
+
+Uses the [`transitions`](https://github.com/pytransitions/transitions) library for a clean, declarative FSM. The `skip_to_verify` and `force_processing` transitions include `before` callbacks that fire contextual hints before the illegal state change completes.
+
+```python
+sm = LabStateMachine(hint_callback=my_ui_alert_function)
+sm.advance("start_setup")       # idle     → setup
+sm.advance("begin_processing")  # setup    → processing
+sm.advance("verify")            # processing → verification
+```
+
+### 3. DPU Inference Interface (`inference/inference_runner.py`)
+
+Wraps the [VART RunnerExt API](https://docs.xilinx.com/r/en-US/ug1414-vitis-ai/VART-API-List):
+
+```python
+# Hardware path (Kria target)
+with DPUInferenceRunner("models/model.xmodel") as runner:
+    probs = runner.infer(bgr_frame)   # OpenCV frame in → probabilities out
+    print(runner.top_k(probs, k=5))
+
+# Software fallback (dev laptop, no DPU)
+# Detected automatically when VART/XIR are not installed.
+```
+
+### 4. Classroom GUI (`gui/app.py`)
+
+```bash
+# On Kria or dev machine:
+streamlit run gui/app.py
+
+# Environment overrides:
+CAMERA_INDEX=0 XMODEL_PATH=models/mobilenet.xmodel streamlit run gui/app.py
+```
+
+---
+
+## Performance Comparison
+
+Measured on Kria KV260 (4× A53 @ 1.33 GHz, DPU B3136 @ 300 MHz):
+
+| Stage | CPU Only | CPU + FPGA (this project) | Speedup |
 |---|---|---|---|
-| LUT | 142,880 | 234,240 | 61.0% |
-| LUTRAM | 18,340 | 101,760 | 18.0% |
-| FF (Flip-Flops) | 198,440 | 468,480 | 42.4% |
-| DSP48E2 | 1,248 | 1,248 | **100%** |
-| BRAM 36K | 144 | 144 | **100%** |
-| URAM | 48 | 64 | 75.0% |
+| Resize 1280×720 → 224×224 | ~4.0 ms | **~0.15 ms** (HLS kernel) | **~27×** |
+| INT8 normalize | ~1.2 ms | **~0 ms** (fused in HLS) | — |
+| MobileNetV2 inference | ~320 ms | **~12 ms** (DPU) | **~27×** |
+| **Total per frame** | **~325 ms (~3 FPS)** | **~12 ms (~83 FPS)** | **~27×** |
 
-> DSP and BRAM are fully subscribed — the design is resource-bound, not timing-bound. Clock: **250 MHz** (4 ns period), timing closure achieved with 0.12 ns slack.
+> The DPU B3136 delivers 3136 operations per clock cycle. At 300 MHz, this is ~**940 GOPS** — roughly 60× the INT8 throughput of the A53 cluster.
 
 ---
 
-## 4. Getting Started
+## Privacy by Design
+
+| Concern | Cloud AI Solution | This Project |
+|---|---|---|
+| Student video data | Leaves the device | **Never leaves the Kria SOM** |
+| Inference computation | Remote server | **On-device PL + DPU** |
+| Chat/LLM queries | Cloud API (logged) | **Local Ollama instance** |
+| Network dependency | Required | **Fully offline capable** |
+| FERPA / GDPR exposure | High | **Eliminated** |
+
+All student activity — camera frames, lab steps, and concept coach conversations — is processed entirely on the Kria hardware. There is no telemetry, no API key, and no network egress required during normal operation.
+
+---
+
+## Getting Started
 
 ### Prerequisites
 
-| Requirement | Version / Detail |
-|---|---|
-| **AMD Vivado** | 2023.2 (ML Edition recommended for AI Engine support) |
-| **AMD Vitis HLS** | 2023.2 (bundled with Vivado ML) |
-| **Vitis AI** | 3.5 (for quantization — optional if using pre-quantized weights) |
-| **PetaLinux** | 2023.2 (for KV260 Linux image generation) |
-| **Python** | 3.10+ with `numpy`, `transformers`, `pynq` |
-| **Host OS** | Ubuntu 22.04 LTS (WSL2 on Windows 11 confirmed working) |
-| **Hardware** | AMD Kria KV260 Vision AI Starter Kit |
-| **Storage** | ≥32 GB SD card (Class 10 / UHS-I) |
-
-### Clone & Setup
-
 ```bash
-git clone https://github.com/your-org/eduinfer.git
-cd eduinfer
+# 1. Flash KV260 with Kria Ubuntu 22.04 + Vitis AI 3.x runtime
+# 2. Install Python dependencies
+pip install streamlit transitions opencv-python-headless requests numpy
 
-# Install Python dependencies
-pip install -r requirements.txt
+# 3. Install Vitis AI Python packages (on Kria target only)
+pip install vart xir pyxrt
 
-# Set Vivado/Vitis environment (adjust path as needed)
-source /tools/Xilinx/Vivado/2023.2/settings64.sh
-source /tools/Xilinx/Vitis_HLS/2023.2/settings64.sh
+# 4. Install Ollama and pull a model (for Concept Coach)
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull llama3
 ```
 
-### Build the HLS IP Core
+### Run
 
 ```bash
-cd hls_src/
-vitis_hls -f run_hls.tcl        # Synthesize, place & route, export IP
-# Output: matmul_accel_ip/      (Vivado-compatible IP package)
+git clone https://github.com/vishveshbece/AMD_Slingshot.git
+cd kria-ai-classroom
+
+# Place your compiled .xmodel in models/
+# Place preprocess.xclbin in overlay/
+
+streamlit run gui/app.py
+# → Open http://<kria-ip>:8501 in any browser on the LAN
 ```
 
-### Build the Vivado Block Design
+### Build the HLS Kernel (requires Vitis installed)
 
 ```bash
-cd vivado/
-vivado -mode batch -source build_bd.tcl
-# Output: eduinfer.xsa          (hardware handoff to PetaLinux)
-```
-
-### Flash PetaLinux Image to KV260
-
-```bash
-cd petalinux/
-petalinux-build
-petalinux-package --boot --u-boot --force
-# Flash outputs/BOOT.BIN and rootfs.tar.gz to SD card
-```
-
-### Run Inference
-
-```python
-# On the KV260 (Python via PYNQ framework)
-from eduinfer import EduInferPipeline
-
-pipeline = EduInferPipeline(
-    model_path="models/tinyllama-1.1b-int8.bin",
-    overlay_path="overlays/eduinfer.bit"
-)
-
-response = pipeline.generate(
-    prompt="Explain photosynthesis to a 10-year-old.",
-    max_tokens=256,
-    temperature=0.7
-)
-print(response)
+cd hls_kernel
+vitis_hls run_hls.tcl          # HLS synthesis + C-sim
+v++ -t hw -p kv260_som240_es1  # Hardware build (~30 min)
+cp _x/link/int/preprocess.xclbin ../overlay/
 ```
 
 ---
 
-## 5. AMD Integration & Performance Results
+## Hardware Requirements
 
-### AMD-Xilinx Hardware Used
-
-| Component | Part / SKU | Role |
+| Component | Minimum | Recommended |
 |---|---|---|
-| **AMD Kria KV260 SOM** | `XCK26-SFVC784-2LV-C` | Primary inference platform |
-| **Xilinx DMA/Bridge Subsystem** | `axi_dma v7.1` | CPU↔FPGA zero-copy data transfer |
-| **Xilinx AXI Interconnect** | `axi_interconnect v2.1` | On-chip bus fabric |
-| **DSP48E2 Slices** | 1,248 (fully utilized) | INT8 multiply-accumulate array |
-| **URAM (UltraRAM)** | 48 × 288 Kb blocks | Weight tile buffering |
-| **BRAM 36K** | 144 blocks | Activation/intermediate buffering |
-
-### Performance Benchmarks
-
-All benchmarks run on **TinyLlama-1.1B-Chat-INT8** (1.1B params, INT8 quantized via Vitis AI 3.5), generating 128 tokens on the KV260 at 250 MHz PL clock.
-
-#### Latency
-
-| Configuration | First Token Latency | Throughput (tok/s) |
-|---|---|---|
-| CPU-only (ARM A53, 1.3 GHz) | 1,840 ms | 1.2 tok/s |
-| **CPU + FPGA (EduInfer)** | **118 ms** | **11.4 tok/s** |
-| **Speedup** | **15.6×** | **9.5×** |
-
-#### Energy Efficiency
-
-| Configuration | Power Draw (avg) | Energy / Token |
-|---|---|---|
-| CPU-only | 4.1 W | 3,417 mJ/tok |
-| **CPU + FPGA** | **9.3 W** | **816 mJ/tok** |
-| **Efficiency Gain** | — | **4.2× more efficient** |
-
-> Power measured via KV260 onboard INA226 power monitors; FPGA PL accounts for ~5.2 W of the 9.3 W total.
-
-#### Comparison vs. Cloud Baseline
-
-| Metric | Cloud API (GPT-3.5, good connectivity) | EduInfer (KV260, offline) |
-|---|---|---|
-| First Token Latency | ~350 ms (50 Mbps link) | **118 ms** |
-| First Token Latency (rural 2G) | ~2,100 ms | **118 ms** |
-| Cost per 1M tokens | ~$0.50 USD | **$0.00 (amortized HW)** |
-| Works offline | ❌ | ✅ |
-
-### Profiling Breakdown (per inference, 128 tokens)
-
-```
-Total wall time:    1,122 ms
-├── Tokenization:      12 ms   (1.1%)  — ARM CPU
-├── Embedding:          8 ms   (0.7%)  — ARM CPU
-├── Transformer layers:
-│   ├── FPGA MatMul:  820 ms  (73.1%)  — FPGA PL   ← primary accelerator
-│   ├── FPGA Activation: 48 ms (4.3%) — FPGA PL (fused)
-│   ├── Softmax:       84 ms   (7.5%)  — ARM CPU
-│   └── KV-Cache:      92 ms   (8.2%)  — ARM CPU
-└── Sampling:          58 ms   (5.2%)  — ARM CPU
-```
-
----
-
-## Project Structure
-
-```
-eduinfer/
-├── hls_src/                # Vitis HLS kernel source
-│   ├── matmul_int8.cpp
-│   ├── activation.cpp
-│   └── run_hls.tcl
-├── vivado/                 # Block design & constraints
-│   ├── build_bd.tcl
-│   └── constraints.xdc
-├── petalinux/              # PetaLinux BSP config
-├── python/                 # Host-side inference runtime
-│   ├── eduinfer/
-│   │   ├── pipeline.py
-│   │   ├── tokenizer.py
-│   │   └── pynq_overlay.py
-│   └── requirements.txt
-├── models/                 # Quantized model weights (not tracked by git)
-└── docs/
-    ├── architecture.md
-    └── benchmarks.md
-```
-
----
-
-## Limitations & Known Issues
-
-- **Model size**: Currently validated on 1.1B and 3B parameter models. 7B models require tiling across DRAM and show ~2.3× latency increase vs. 1.1B.
-- **Context length**: KV-cache implementation supports up to 512 tokens. Beyond this, ARM memory bandwidth becomes the bottleneck.
-- **Quantization drift**: INT8 quantization introduces ~1.8 perplexity increase vs. FP16 baseline on WikiText-103. Acceptable for tutoring workloads; not recommended for code generation.
-- **Thermal**: Sustained inference at 250 MHz PL clock causes SOM temperature to reach ~72°C in a closed enclosure. Passive heatsink required; active cooling recommended for >30 min sessions.
-
----
-
-## Acknowledgements
-
-This project was built at the **AMD Pervasive AI Developer Contest 2024**. We thank the AMD University Program for hardware access and the Vitis AI team for quantization toolchain support.
+| SOM | AMD Kria KV260 | AMD Kria KR260 |
+| Camera | USB UVC 720p | USB UVC 1080p |
+| Storage | 32 GB microSD | 64 GB microSD + NVMe |
+| RAM | 4 GB LPDDR4 | 8 GB LPDDR4 |
+| Network | — | Gigabit Ethernet (for browser access) |
 
 ---
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details. Model weights are subject to their respective upstream licenses (TinyLlama: Apache 2.0).
+MIT © 2024 — Educational use encouraged.

@@ -1,0 +1,16 @@
+# ── Core GUI & ML ──────────────────────────────────────────────────────────
+streamlit>=1.35.0
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+requests>=2.31.0
+
+# ── State Machine ───────────────────────────────────────────────────────────
+transitions>=0.9.0
+
+# ── Vitis AI / XRT (install on Kria target from AMD packages, not PyPI) ────
+# vart          — installed via Vitis AI runtime DEB package
+# xir           — installed via Vitis AI runtime DEB package
+# pyxrt         — installed via XRT DEB package
+
+# ── Local LLM server (install separately) ──────────────────────────────────
+# ollama        — https://ollama.com/install.sh
